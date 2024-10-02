@@ -1,0 +1,623 @@
+---
+title: "AI-Powered Affordable Housing Recommendation and Exploration System for Philadelphia"
+author: "Hema Srinivasarangarajan"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    theme: cosmo
+    highlight: tango
+  pdf_document:
+    toc: true
+  word_document:
+    toc: true
+---
+```{r setup, include=FALSE,  message=FALSE, warning=FALSE }
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(sf)
+library(leaflet)
+library(tidycensus)
+library(randomForest)
+library(randomForestExplainer)
+library(shiny)
+library(data.table)
+
+census_api_key("b2008dc88b399d3de122401ab18a8c46095064d0" , install = TRUE , overwrite=TRUE)
+```
+
+
+```{r load_data, message=FALSE, warning=FALSE , echo = FALSE}
+merged_data <- readRDS("preprocessed_data.rds")
+
+```
+
+```{r ,  message=FALSE, warning=FALSE  }
+affordable_housing <- fread("Affordable_Housing_Philly.csv")
+geojson_data <- st_read("Affordable_Housing.geojson")
+# Function to get or load cached PUMS data
+get_cached_pums <- function(puma) {
+  cache_file <- paste0("pums_data_", puma, ".rds")
+  
+  if (file.exists(cache_file)) {
+    readRDS(cache_file)
+  } else {
+    data <- get_pums(
+      variables = c("AGEP", "DIS", "HINCP"),
+      state = "PA",
+      puma = puma,
+      year = 2019,
+      survey = "acs5",
+      recode = FALSE,
+      variables_filter = list(AGEP = 30:49)
+    )
+    saveRDS(data, cache_file)
+    data
+  }
+}
+
+# List of PUMAs
+pumas <- c("3701", "3702", "3703", "3704", "3705", "3706", "3707", "3708", "3709")
+
+# Get data for all PUMAs
+pums_data_list <- lapply(pumas, get_cached_pums)
+
+pums_data <- do.call(rbind, pums_data_list)
+
+# Download PUMA boundaries for Pennsylvania
+puma_boundaries <- tigris::pumas(state = "PA", cb = TRUE, year = 2019)
+
+# Convert affordable housing data to sf object using coordinates from GeoJSON
+affordable_housing_sf <- st_as_sf(geojson_data)
+
+# Ensure the CRS of both datasets match
+affordable_housing_sf <- st_transform(affordable_housing_sf, st_crs(puma_boundaries))
+
+# Perform spatial join to assign PUMA codes to affordable housing data
+affordable_housing_with_puma <- st_join(affordable_housing_sf, puma_boundaries, join = st_within)
+
+# Aggregate PUMS data to PUMA level
+pums_aggregated <- pums_data %>%
+  group_by(PUMA) %>%
+  summarize(
+    median_age = median(AGEP, na.rm = TRUE),
+    pct_disability = mean(DIS == 1, na.rm = TRUE) * 100,
+    median_income = median(HINCP, na.rm = TRUE)
+  )
+
+# Merge aggregated PUMS data with the housing data
+merged_data <- affordable_housing_with_puma %>%
+  mutate(PUMA = as.character(PUMACE10)) %>%
+  left_join(pums_aggregated, by = "PUMA")
+
+# Feature Engineering
+merged_data <- merged_data %>%
+  mutate(
+    accessibility_score = case_when(
+      !is.na(ACCESSIBLE_UNITS) & !is.na(SENSORY_UNITS) & !is.na(VISITABLE_UNITS) & !is.na(TOTAL_UNITS) & TOTAL_UNITS > 0 ~ 
+        (ACCESSIBLE_UNITS + SENSORY_UNITS + VISITABLE_UNITS) / TOTAL_UNITS * 100,
+      TRUE ~ NA_real_
+    ),
+    affordability_ratio = case_when(
+      !is.na(TOTAL_UNITS) & !is.na(median_income) & median_income > 0 ~ TOTAL_UNITS / median_income,
+      TRUE ~ NA_real_
+    ),
+    age_friendly = ifelse(median_age > 65, 1, 0),
+    high_disability_area = ifelse(pct_disability > mean(pct_disability, na.rm = TRUE), 1, 0)
+  )
+
+summary(merged_data)
+```
+
+
+```{r Exploratory_Data_Analysis_(EDA), message=FALSE, warning=FALSE  }
+
+merged_data <- merged_data %>%
+  mutate(pct_accessible = ifelse(TOTAL_UNITS > 0, 
+                                 (ACCESSIBLE_UNITS / TOTAL_UNITS) * 100, 
+                                 0))
+
+# Create improved histogram
+p1 <- ggplot(merged_data, aes(x = pct_accessible)) +
+  geom_histogram(binwidth = 10, fill = "skyblue", color = "darkblue", alpha = 0.7) +
+  labs(title = "Distribution of Accessible Housing in Philadelphia",
+       x = "Percentage of Accessible Units",
+       y = "Number of Projects") +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold")) +
+  scale_x_continuous(breaks = seq(0, 100, by = 20)) +
+  scale_y_continuous(breaks = seq(0, max(table(cut(merged_data$pct_accessible, breaks = seq(0, 100, by = 10)))), by = 5))
+
+print(p1)
+
+#Description: This histogram shows the distribution of the percentage of accessible units across housing projects. Each bar represents a 10% range of accessibility, and the height of the bar shows how many projects fall into that range.
+
+
+#Accessibility vs Affordability 
+
+# Create  scatter plot
+p2 <- ggplot(merged_data, aes(x = accessibility_score, y = affordability_ratio)) +
+  geom_point(aes(color = PROJECT_TYPE, size = TOTAL_UNITS), alpha = 0.7) +
+  scale_size_continuous(range = c(3, 10)) +
+  labs(title = "Accessibility vs Affordability of Housing Projects",
+       x = "Accessibility Score",
+       y = "Affordability Ratio",
+       color = "Project Type",
+       size = "Total Units") +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "right") +
+  scale_color_brewer(palette = "Set1")
+
+print(p2) 
+
+#Description: This scatter plot shows the relationship between accessibility scores and affordability ratios. Each point represents a housing project, with the color indicating the project type and the size representing the total number of units.
+
+
+#Trends in Affordable, Accessible Housing Over Time: 
+  
+  #  yearly data
+merged_data_yearly <- merged_data %>%
+  group_by(FISCAL_YEAR_COMPLETE) %>%
+  summarize(
+    avg_accessibility = mean(accessibility_score, na.rm = TRUE),
+    avg_affordability = mean(affordability_ratio, na.rm = TRUE),
+    total_units = sum(TOTAL_UNITS, na.rm = TRUE)
+  )
+
+#  improved line plot
+p3 <- ggplot(merged_data_yearly, aes(x = FISCAL_YEAR_COMPLETE)) +
+  geom_line(aes(y = avg_accessibility, color = "Accessibility"), size = 1.5) +
+  geom_line(aes(y = avg_affordability * 1000, color = "Affordability"), size = 1.5) +
+  geom_col(aes(y = total_units / 100, fill = "Total Units"), alpha = 0.3) +
+  scale_y_continuous(
+    name = "Accessibility Score / Affordability Ratio",
+    sec.axis = sec_axis(~.*100, name = "Total Units")
+  ) +
+  scale_color_manual(values = c("Accessibility" = "blue", "Affordability" = "red")) +
+  scale_fill_manual(values = c("Total Units" = "gray")) +
+  labs(title = "Trends in Affordable, Accessible Housing Over Time",
+       x = "Year",
+       color = "Metric",
+       fill = "") +
+  theme_minimal() +
+  theme(text = element_text(size = 12),
+        plot.title = element_text(size = 16, face = "bold"),
+        legend.position = "bottom",
+        axis.text.x = element_text(angle = 45, hjust = 1))
+
+print(p3)
+
+# ***Note: This graph illustrates the trends in affordable and accessible housing in Philadelphia over time***
+# ***It shows a significant improvement in housing accessibility (blue line) in recent years, particularly from 2015 to 2020,*** 
+# ***while affordability (red line) has remained relatively constant. The gray bars indicate the number of housing units*** 
+# ***added each year, showing fluctuations in housing development activity.*** 
+library(leaflet)
+library(sf)
+library(RColorBrewer)
+
+merged_data_sf <- st_as_sf(merged_data, coords = c("longitude", "latitude"), crs = 4326)
+
+pal <- colorNumeric(
+  palette = "RdYlGn",  # Red-Yellow-Green palette
+  domain = merged_data_sf$accessibility_score,
+  na.color = "transparent"  # Gray for NA values
+)
+
+# Create the map
+map <- leaflet(merged_data_sf) %>%
+  addTiles() %>%  # Add default OpenStreetMap tiles
+  addCircleMarkers(
+    radius = ~sqrt(TOTAL_UNITS) * 0.5,  # Size based on total units
+    fillColor = ~pal(accessibility_score),
+    color = "black",  # Black border for contrast
+    weight = 1,
+    opacity = 1,
+    fillOpacity = 0.7,
+    popup = ~paste(
+      "<strong>", PROJECT_NAME, "</strong><br>",
+      "Accessibility Score: ", round(accessibility_score, 2), "<br>",
+      "Total Units: ", TOTAL_UNITS, "<br>",
+      "Project Type: ", PROJECT_TYPE
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~accessibility_score,
+    opacity = 0.7,
+    title = "Accessibility Score",
+    position = "bottomright",
+    labFormat = labelFormat(suffix = "%")
+  )
+
+# Display the map
+map
+
+# Color Range:
+# 
+# Red: Represents lower accessibility scores (closer to 0%)
+# Yellow: Represents medium accessibility scores (around 50%)
+# Green: Represents higher accessibility scores (closer to 100% or above)
+# Black circles: Represents projects with NA or missing accessibility scores
+# To interpret the map:
+# 
+# Look at the color of each marker to gauge accessibility (green is best, red is worst).
+# Look at the size of each marker to understand the scale of the project (bigger means more units).
+
+
+```
+
+
+
+#Step 5: Machine Learning Model Development 
+
+```{r  Machine_Learning_Model_Development, message=FALSE, warning=FALSE  }
+library(randomForest)
+library(caret)
+library(tidyverse)
+library(sf)
+
+# Prepare the data for modeling
+model_data <- merged_data %>%
+  st_drop_geometry() %>%  # This will remove the geometry column
+  select(accessibility_score, affordability_ratio, TOTAL_UNITS, 
+         ACCESSIBLE_UNITS, SENSORY_UNITS, VISITABLE_UNITS, 
+         PROJECT_TYPE, median_age, pct_disability, median_income) %>%
+  mutate(PROJECT_TYPE = as.factor(PROJECT_TYPE)) %>%  # Convert PROJECT_TYPE to factor
+  select_if(~!is.list(.)) %>%  # Remove any remaining list columns
+  na.omit()  # Remove rows with NA values
+
+# Print column names to verify
+print(colnames(model_data))
+
+# Create a 'suitability' score as our target variable
+model_data$suitability <- with(model_data, 
+                               (accessibility_score + affordability_ratio * 1000) / 2)
+
+# Split the data into training and testing sets
+set.seed(123)  # for reproducibility
+train_index <- createDataPartition(model_data$suitability, p = 0.8, list = FALSE)
+train_data <- model_data[train_index, ]
+test_data <- model_data[-train_index, ]
+
+# Train the Random Forest model
+rf_model <- randomForest(suitability ~ . - suitability, data = train_data, ntree = 500)
+
+# Make predictions on the test set
+predictions <- predict(rf_model, newdata = test_data)
+
+# Evaluate model performance
+mse <- mean((predictions - test_data$suitability)^2)
+rmse <- sqrt(mse)
+r_squared <- 1 - (sum((test_data$suitability - predictions)^2) / 
+                  sum((test_data$suitability - mean(test_data$suitability))^2))
+
+cat("Mean Squared Error:", mse, "/n")
+cat("Root Mean Squared Error:", rmse, "/n")
+cat("R-squared:", r_squared, "/n")
+
+# Feature importance
+importance <- importance(rf_model)
+importance_df <- data.frame(Feature = rownames(importance), Importance = importance[,1])
+importance_df <- importance_df[order(-importance_df$Importance),]
+print(importance_df)
+
+# Plot feature importance
+ggplot(importance_df, aes(x = reorder(Feature, Importance), y = Importance)) +
+  geom_bar(stat = "identity", fill = "steelblue") +
+  coord_flip() +
+  labs(title = "Feature Importance in Random Forest Model",
+       x = "Features",
+       y = "Importance") +
+  theme_minimal()
+```
+
+
+
+
+
+#Step 6: Spatial Analysis
+
+
+```{r Spatial_Analysis, message=FALSE, warning=FALSE}
+library(spdep)
+library(sf)
+library(leaflet)
+library(dplyr)
+
+#str(merged_data)
+#print(colnames(merged_data))
+
+merged_data_sf <- merged_data %>%
+  st_as_sf() %>%  # Convert to sf object if it's not already
+  mutate(longitude = st_coordinates(.)[,1],
+         latitude = st_coordinates(.)[,2]) %>%
+  filter(!is.na(longitude) & !is.na(latitude) & !is.na(accessibility_score))
+
+# Print the number of rows before and after filtering
+cat("Rows before filtering:", nrow(merged_data), "/n")
+cat("Rows after filtering:", nrow(merged_data_sf), "/n")
+
+# Calculate nearest neighbors
+nn <- knearneigh(st_coordinates(merged_data_sf), k = 5)
+nn_list <- knn2nb(nn)
+
+# This code performs spatial analysis on housing accessibility scores in Philadelphia.
+# It calculates Moran's I for global spatial autocorrelation and conducts Getis-Ord Gi* 
+# hotspot analysis. Moran's I (0.004726, p=0.2507) suggests random distribution of 
+# accessibility scores. The hotspot map visualizes local clusters of high (red) and 
+# low (blue) accessibility, aiding in identifying areas for potential policy focus.
+accessibility_moran <- moran.test(merged_data_sf$accessibility_score, 
+                                  nb2listw(nn_list, style = "W"))
+print(accessibility_moran)
+
+# Hot spot analysis using Getis-Ord Gi*
+weights <- nb2listw(nn_list, style = "W")
+hotspots <- localG(merged_data_sf$accessibility_score, weights)
+
+# Add hotspot results to our data
+merged_data_sf$hotspot <- as.vector(hotspots)
+
+# Create a map of hotspots
+pal <- colorNumeric(palette = "RdBu", domain = c(-3, 3))
+
+hotspot_map <- leaflet(merged_data_sf) %>%
+  addTiles() %>%
+  addCircleMarkers(
+    radius = 5,
+    fillColor = ~pal(hotspot),
+    color = "black",
+    weight = 1,
+    opacity = 1,
+    fillOpacity = 0.7,
+    popup = ~paste(
+      "<strong>", PROJECT_NAME, "</strong><br>",
+      "Accessibility Score: ", round(accessibility_score, 2), "<br>",
+      "Hotspot Z-score: ", round(hotspot, 2)
+    )
+  ) %>%
+  addLegend(
+    pal = pal,
+    values = ~hotspot,
+    opacity = 0.7,
+    title = "Hotspot Analysis",
+    position = "bottomright"
+  )
+
+# Display the hotspot map
+hotspot_map
+
+
+```
+# 
+# ```{r Shiny_APP, message=FALSE, warning=FALSE}
+# library(shiny)
+# library(leaflet)
+# library(dplyr)
+# library(sf)
+# library(ggplot2)
+# library(randomForest)
+# library(viridis)
+# 
+# ui <- fluidPage(
+#   titlePanel("Philadelphia Affordable Housing Explorer"),
+#   
+#   sidebarLayout(
+#     sidebarPanel(
+#       sliderInput("accessibility", "Minimum Accessibility Score:",
+#                   min = 0, max = 100, value = 0),
+#       textOutput("accessibility_description"),
+#       selectInput("project_type", "Project Type:",
+#                   choices = c("All"), # We'll update this in the server
+#                   selected = "All"),
+#       sliderInput("total_units", "Minimum Total Units:",
+#                   min = 0, max = 100, value = 0), # We'll update max in the server
+#       textOutput("total_units_description"),
+#       actionButton("recommend", "Get Recommendations"),
+#       
+#       # Feedback section
+#       hr(),
+#       checkboxGroupInput("feedback_categories", "Feedback Categories:",
+#                          choices = c("Data Accuracy", "Feature Request", "User Experience"),
+#                          selected = NULL),
+#       textAreaInput("feedback_text", "Feedback:", placeholder = "Enter your feedback here"),
+#       actionButton("submit_feedback", "Submit Feedback")
+#     ),
+#     
+#     mainPanel(
+#       leafletOutput("map"),
+#       plotOutput("accessibility_plot"),
+#       verbatimTextOutput("recommendations"),
+#       verbatimTextOutput("explanation"),
+#       uiOutput("project_profile")
+#     )
+#   )
+# )
+# 
+# server <- function(input, output, session) {
+#   # Load preprocessed data
+#   merged_data_sf <- readRDS("preprocessed_data.rds")
+#   
+#   # Update UI elements based on loaded data
+#   observe({
+#     updateSelectInput(session, "project_type", 
+#                       choices = c("All", unique(merged_data_sf$PROJECT_TYPE)))
+#     updateSliderInput(session, "total_units", 
+#                       max = max(merged_data_sf$TOTAL_UNITS, na.rm = TRUE))
+#   })
+# 
+#   output$accessibility_description <- renderText({
+#     "The Accessibility Score represents the level of accessibility features and amenities for the housing project, with 0 being the least accessible and 100 being the most accessible. Use this slider to filter the projects based on your minimum accessibility requirements."
+#   })
+#   
+#   output$total_units_description <- renderText({
+#     "The Minimum Total Units slider allows you to filter the displayed projects based on the total number of units in the housing development. This can help you find projects that meet your desired project size."
+#   })
+#   
+#   filtered_data <- reactive({
+#     data <- merged_data_sf
+#     
+#     if (input$project_type != "All") {
+#       data <- data[data$PROJECT_TYPE == input$project_type, ]
+#     }
+#     
+#     data <- data[data$accessibility_score >= input$accessibility &
+#                  data$TOTAL_UNITS >= input$total_units, ]
+#     
+#     return(data)
+#   })
+# 
+#   # Train the Random Forest model on the data frame without the geometry column
+#   rf_model <- reactive({
+#     data <- st_drop_geometry(merged_data_sf) %>%
+#       select_if(is.numeric) %>%
+#       na.omit()
+#     
+#     randomForest(accessibility_score ~ ., data = data)
+#   })
+# 
+#   output$map <- renderLeaflet({
+#     data <- filtered_data() %>%
+#       filter(!is.na(st_coordinates(.)[,1]) & !is.na(st_coordinates(.)[,2]))
+#     
+#     leaflet(data) %>%
+#       addTiles() %>%
+#       addCircleMarkers(
+#         radius = ~sqrt(TOTAL_UNITS),
+#         fillColor = ~colorNumeric("viridis", accessibility_score)(accessibility_score),
+#         fillOpacity = 0.7,
+#         color = "white",
+#         weight = 1,
+#         popup = ~paste(
+#           "<strong>", PROJECT_NAME, "</strong><br>",
+#           "Accessibility Score: ", round(accessibility_score, 2), "<br>",
+#           "Total Units: ", TOTAL_UNITS
+#         )
+#       ) %>%
+#       addLegend(
+#         "bottomright",
+#         title = "Accessibility Score",
+#         colors = viridis(5),
+#         labels = c("0-20", "20-40", "40-60", "60-80", "80-100")
+#       )
+#   })
+#   
+#   output$accessibility_plot <- renderPlot({
+#     ggplot(filtered_data(), aes(x = accessibility_score)) +
+#       geom_histogram(binwidth = 5, fill = "skyblue", color = "black") +
+#       labs(title = "Distribution of Accessibility Scores",
+#            x = "Accessibility Score",
+#            y = "Count")
+#   })
+#   
+#   output$recommendations <- renderPrint({
+#     req(input$recommend)
+#     tryCatch({
+#       top_recommendations <- filtered_data() %>%
+#         arrange(desc(accessibility_score)) %>%
+#         head(5)
+#       
+#       if(nrow(top_recommendations) == 0) {
+#         cat("No recommendations available based on current filters.")
+#         return()
+#       }
+#       
+#       cat("Top Recommended Projects:\n")
+#       for (i in 1:nrow(top_recommendations)) {
+#         project <- top_recommendations[i, ]
+#         cat(sprintf("%d. %s\n", i, project$PROJECT_NAME))
+#         cat("   Accessibility Score:", round(project$accessibility_score, 2), "\n")
+#         cat("   Total Units:", project$TOTAL_UNITS, "\n")
+#         
+#         # Display the top 3 important features for the recommendation
+#         cat("   Key Factors:\n")
+#         importance <- importance(rf_model())[, 1]
+#         top_features <- names(sort(importance, decreasing = TRUE))[1:3]
+#         for (feature in top_features) {
+#           cat("     -", feature, "\n")
+#         }
+#         cat("\n")
+#       }
+#     }, error = function(e) {
+#       cat("Error generating recommendations:", conditionMessage(e))
+#     })
+#   })
+#   
+#   output$explanation <- renderText({
+#     paste("Based on your selections:",
+#           ifelse(input$accessibility > 50, "You're prioritizing high accessibility. ", ""),
+#           ifelse(input$total_units > 20, "You're looking for larger projects. ", ""),
+#           "The map shows projects meeting your criteria, with colors indicating accessibility scores and circle size representing the total number of units.")
+#   })
+#   
+#   # Detailed Project Profiles
+#   output$project_profile <- renderUI({
+#     req(input$map_marker_click)
+#     marker_data <- filtered_data()[input$map_marker_click$id, ]
+# 
+#     modalDialog(
+#       title = marker_data$PROJECT_NAME,
+#       footer = modalButton("Close"),
+#       fluidRow(
+#         column(6,
+#                p(strong("Accessibility Score:"), round(marker_data$accessibility_score, 2)),
+#                p(strong("Total Units:"), marker_data$TOTAL_UNITS),
+#                p(strong("Affordability Ratio:"), round(marker_data$affordability_ratio, 2))),
+#         column(6,
+#                p(strong("Target Population:"), marker_data$PROJECT_TYPE),
+#                p(strong("Accessibility Features:"), 
+#                   sprintf("Accessible: %d, Sensory: %d, Visitable: %d", 
+#                           marker_data$ACCESSIBLE_UNITS, marker_data$SENSORY_UNITS, marker_data$VISITABLE_UNITS)),
+#                p(strong("Contact:"), marker_data$CONTACT_INFO))
+#       )
+#     )
+#   })
+# 
+#   observeEvent(input$map_marker_click, {
+#     showModal(output$project_profile)
+#   })
+# 
+#   # Feedback submission
+#   feedback_file_path <- "feedback_data.csv"
+# 
+#   observeEvent(input$submit_feedback, {
+#     feedback_data <- data.frame(
+#       categories = paste(input$feedback_categories, collapse = ", "),
+#       text = input$feedback_text,
+#       timestamp = Sys.time()
+#     )
+# 
+#     if (!file.exists(feedback_file_path)) {
+#       write.csv(feedback_data, feedback_file_path, row.names = FALSE)
+#     } else {
+#       write.table(feedback_data, feedback_file_path, append = TRUE, row.names = FALSE, col.names = FALSE, sep = ",")
+#     }
+#     
+#     showNotification("Feedback submitted successfully", type = "message")
+#   })
+# }
+# 
+# shinyApp(ui = ui, server = server)
+# ```
+
+
+# ```{r deploy, eval=TRUE}
+# rsconnect::setAccountInfo(name='hema-r-programs',
+# 			  token='F78CC7D62C9B20FCB457FB1C89CC481C',
+# 			  secret='CF+5EMF4TMSRmPVDt7GLTEk9yU538nAKSJkIU9tU')
+# 
+# # rsconnect::deployApp(
+# #   appDir = "C:/Users/Hema_ASU/OneDrive/Desktop/ASU/Project/Final Output",
+# #   appFiles = c("Final-Project.Rmd", "preprocessed_data.rds", "feedback_data.csv"),
+# #   logLevel = "verbose",
+# #   appName = "PhillyHousingExplorer"
+# # )
+# 
+# rsconnect::deployApp(appName = "PhillyHousingExplorer", logLevel = "verbose")
+```
+
+
