@@ -1,2 +1,3 @@
-# Philly-Project
-A prototype AI-powered system to recommend and explore affordable and accessible housing options in Philadelphia, focusing on enhancing accessibility and affordability for older adults and individuals with disabilities.
+# AI-Powered Affordable Housing Recommendation and Exploration System for Philadelphia
+This project develops a prototype AI-powered affordable housing recommendation and exploration system for Philadelphia.
+- **Shiny App:** https://hema-r-programs.shinyapps.io/PhillyHousingExplorer/
